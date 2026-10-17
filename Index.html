@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.37;
+
+contract ZenithFreelanceEscrowHub {
+    enum GigStatus { Open, InProgress, Completed, Canceled }
+
+    struct Gig {
+        address payable client;
+        address payable freelancer;
+        uint256 payoutWei;
+        GigStatus status;
+        bytes32 taskHash;
+    }
+
+    address payable public immutable hubAdmin;
+    string public hubDescriptor;
+    uint256 public hubFeeBps; // 250 = 2.5%
+    uint256 public gigCounter;
+    uint256 public accumulatedFees;
+    bool public isHubPaused;
+
+    mapping(uint256 => Gig) public gigs;
+
+    event GigFunded(uint256 indexed gigId, address indexed client, uint256 payout);
+    event GigAccepted(uint256 indexed gigId, address indexed freelancer);
+    event GigResolved(uint256 indexed gigId, address indexed freelancer, uint256 netPayout);
+    event GigCanceled(uint256 indexed gigId, uint256 refundedAmount);
+    event TreasuryDeposited(address indexed funder, uint256 amount);
+    event ReservesDrained(address indexed admin, uint256 amount);
+    event FeesHarvested(address indexed admin, uint256 amount);
+    event HubPauseToggled(bool isPaused);
+    event DescriptorUpdated(string newDescriptor);
+
+    modifier onlyAdmin() {
+        require(msg.sender == hubAdmin, "ZenithEscrow: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isHubPaused, "ZenithEscrow: Hub is paused");
+        _;
+    }
+
+    constructor() {
+        hubAdmin = payable(msg.sender);
+        hubDescriptor = "Zenith Base Freelance Escrow Core v1";
+        hubFeeBps = 250; // 2.5%
+        isHubPaused = false;
+    }
+
+    // 1. acceptGigOffer
+    function acceptGigOffer(uint256 gigId) external whenNotPaused {
+        Gig storage g = gigs[gigId];
+        require(gigId > 0 && gigId <= gigCounter, "ZenithEscrow: Invalid ID");
+        require(g.status == GigStatus.Open, "ZenithEscrow: Gig not open");
+
+        g.freelancer = payable(msg.sender);
+        g.status = GigStatus.InProgress;
+
+        emit GigAccepted(gigId, msg.sender);
+    }
+
+    // 2. cancelGigOffer
+    function cancelGigOffer(uint256 gigId) external {
+        Gig storage g = gigs[gigId];
+        require(gigId > 0 && gigId <= gigCounter, "ZenithEscrow: Invalid ID");
+        require(msg.sender == g.client || msg.sender == hubAdmin, "ZenithEscrow: Unauthorized");
+        require(g.status == GigStatus.Open, "ZenithEscrow: Cannot cancel active gig");
+
+        g.status = GigStatus.Canceled;
+        uint256 refund = g.payoutWei;
+        g.payoutWei = 0;
+
+        if (refund > 0) {
+            (bool sent, ) = g.client.call{value: refund}("");
+            require(sent, "ZenithEscrow: Refund failed");
+        }
+
+        emit GigCanceled(gigId, refund);
+    }
+
+    // 3. depositHubTreasury
+    function depositHubTreasury() external payable whenNotPaused {
+        require(msg.value > 0, "ZenithEscrow: Zero deposit");
+        accumulatedFees += msg.value;
+        emit TreasuryDeposited(msg.sender, msg.value);
+    }
+
+    // 4. drainHubReserves
+    function drainHubReserves() external onlyAdmin {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "ZenithEscrow: Zero balance");
+
+        accumulatedFees = 0;
+        (bool sent, ) = hubAdmin.call{value: balance}("");
+        require(sent, "ZenithEscrow: Sweep failed");
+
+        emit ReservesDrained(hubAdmin, balance);
+    }
+
+    // 5. fundNewGig
+    function fundNewGig(bytes32 taskHash) external payable whenNotPaused returns (uint256) {
+        require(msg.value > 0, "ZenithEscrow: Zero funding not allowed");
+
+        gigCounter++;
+        gigs[gigCounter] = Gig({
+            client: payable(msg.sender),
+            freelancer: payable(address(0)),
+            payoutWei: msg.value,
+            status: GigStatus.Open,
+            taskHash: taskHash
+        });
+
+        emit GigFunded(gigCounter, msg.sender, msg.value);
+        return gigCounter;
+    }
+
+    // 6. harvestHubFees
+    function harvestHubFees() external onlyAdmin {
+        uint256 amount = accumulatedFees;
+        require(amount > 0, "ZenithEscrow: Zero fees");
+
+        accumulatedFees = 0;
+        (bool sent, ) = hubAdmin.call{value: amount}("");
+        require(sent, "ZenithEscrow: Harvest failed");
+
+        emit FeesHarvested(hubAdmin, amount);
+    }
+
+    // 7. pauseEscrowHub
+    function pauseEscrowHub(bool isPaused) external onlyAdmin {
+        isHubPaused = isPaused;
+        emit HubPauseToggled(isPaused);
+    }
+
+    // 8. resolveGigPayout
+    function resolveGigPayout(uint256 gigId) external {
+        Gig storage g = gigs[gigId];
+        require(gigId > 0 && gigId <= gigCounter, "ZenithEscrow: Invalid ID");
+        require(msg.sender == g.client || msg.sender == hubAdmin, "ZenithEscrow: Unauthorized");
+        require(g.status == GigStatus.InProgress, "ZenithEscrow: Not in progress");
+
+        g.status = GigStatus.Completed;
+        
+        uint256 fee = (g.payoutWei * hubFeeBps) / 10000;
+        uint256 freelancerShare = g.payoutWei - fee;
+        
+        accumulatedFees += fee;
+        g.payoutWei = 0;
+
+        if (freelancerShare > 0) {
+            (bool sent, ) = g.freelancer.call{value: freelancerShare}("");
+            require(sent, "ZenithEscrow: Freelancer payout failed");
+        }
+
+        emit GigResolved(gigId, g.freelancer, freelancerShare);
+    }
+
+    // 9. updateHubDescriptor
+    function updateHubDescriptor(string calldata newDescriptor) external onlyAdmin {
+        require(bytes(newDescriptor).length > 0, "ZenithEscrow: Empty string");
+        hubDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // Read-метод
+    function getGigInfo(uint256 gigId) external view returns (
+        address client,
+        address freelancer,
+        uint256 payoutWei,
+        GigStatus status,
+        bytes32 taskHash
+    ) {
+        Gig memory g = gigs[gigId];
+        return (g.client, g.freelancer, g.payoutWei, g.status, g.taskHash);
+    }
+}
